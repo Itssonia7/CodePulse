@@ -1957,3 +1957,17 @@ model ExecutiveReportJob {
   @@map("executive_report_jobs")
 }
 
+
+model AiReviewAudit {
+  id                 String   @id @default(cuid())
+  repository         String
+  prNumber           Int
+  eventName          String
+  diagnosticsCount   Int      @default(0)
+  suggestionsPosted  Int      @default(0)
+  acceptedCount      Int      @default(0)
+  fixAcceptanceRate  Float    @default(0)
+  createdAt          DateTime @default(now())
+
+  @@index([repository, prNumber])
+}
