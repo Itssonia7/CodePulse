@@ -1,385 +1,83 @@
-import {
-  Injectable,
-  Logger,
-  OnModuleInit,
-  OnModuleDestroy,
-  Optional,
-} from '@nestjs/common';
-import { PrismaClient } from '@prisma/client';
-import { ReplicaBalancerService } from './replica-balancer.service';
-import { ShardingRouterService } from './sharding-router.service';
-import {
-  TenantShardingService,
-  MapReduceQueryOptions,
-  MapReduceResult,
-} from './tenant-sharding.service';
-import { VaultService } from '../modules/security/vault.service';
-import { ReplicaRouter, RouteContext } from '../common/db/replica-router';
-import {
-  DeadlockResolverService,
-  type DeadlockRetryOptions,
-} from '../common/monitoring/deadlock-resolver.service';
-import {
-  ZeroDowntimeMigrationEngine,
-  DualWriteCoordinator,
-  type BackfillOptions,
-  type BackfillProgress,
-  type ExpandPlan,
-  type ContractPlan,
-  type PreflightLockCheckResult,
-  type VerificationResult,
-} from './zero-downtime';
-
-const DEFAULT_SLOW_QUERY_THRESHOLD_MS = 200;
-
-function slowQueryThresholdMs(value: string | undefined): number {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0
-    ? parsed
-    : DEFAULT_SLOW_QUERY_THRESHOLD_MS;
+export interface FederatedReportFilter {
+  minXp?: number;
+  role?: string;
+  limit?: number;
 }
 
-function constructDatabaseUrlWithCredentials(
-  baseUrl: string,
-  user: string,
-  pass: string,
-): string {
-  try {
-    const parsed = new URL(baseUrl);
-    parsed.username = encodeURIComponent(user);
-    parsed.password = encodeURIComponent(pass);
-    return parsed.toString();
-  } catch {
-    return baseUrl;
-  }
+export interface FederatedJoinQueryPlan {
+  sql: string;
+  params: Array<string | number>;
+  pushesDownFilters: boolean;
+  foreignSchemasUsed: string[];
 }
 
-@Injectable()
-export class PrismaService
-  extends PrismaClient<{ log: [{ emit: 'event'; level: 'query' }] }>
-  implements OnModuleInit, OnModuleDestroy
-{
-  private readonly logger = new Logger(PrismaService.name);
+export interface RawSqlRunner {
+  queryRaw: (sql: string, params: Array<string | number>) => Promise<unknown[]> | unknown[];
+}
 
-  constructor(
-    @Optional()
-    public readonly replicaBalancer?: ReplicaBalancerService,
-    @Optional()
-    public readonly vaultService?: VaultService,
-    @Optional()
-    public readonly shardingRouter?: ShardingRouterService,
-    @Optional()
-    public readonly tenantSharding?: TenantShardingService,
-    @Optional()
-    public readonly replicaRouter?: ReplicaRouter,
-    @Optional()
-    public readonly deadlockResolver?: DeadlockResolverService,
-  ) {
-    const dynamicCreds = vaultService?.getCurrentDatabaseCredential();
-    const baseDbUrl = process.env.DATABASE_URL;
+export function buildFederatedAdminReportQuery(
+  filter: FederatedReportFilter = {},
+): FederatedJoinQueryPlan {
+  const params: Array<string | number> = [];
+  const predicates: string[] = [];
 
-    const datasourceUrl =
-      dynamicCreds && baseDbUrl
-        ? constructDatabaseUrlWithCredentials(
-            baseDbUrl,
-            dynamicCreds.username,
-            dynamicCreds.password,
-          )
-        : undefined;
-
-    super({
-      log: [{ emit: 'event', level: 'query' }],
-      ...(datasourceUrl ? { datasources: { db: { url: datasourceUrl } } } : {}),
-    });
-
-    const thresholdMs = slowQueryThresholdMs(
-      process.env.SLOW_QUERY_THRESHOLD_MS,
-    );
-    this.$on('query', (event) => {
-      if (event.duration <= thresholdMs) return;
-
-      // Prisma parameters can contain credentials and personal data. Keep the
-      // SQL and count for diagnosis, but never write parameter values to logs.
-      let parameterCount: number | null = null;
-      try {
-        const parameters: unknown = JSON.parse(event.params);
-        if (Array.isArray(parameters)) parameterCount = parameters.length;
-      } catch {
-        // Some providers serialize parameters differently; timing still logs.
-      }
-
-      this.logger.warn(
-        JSON.stringify({
-          event: 'slow_prisma_query',
-          durationMs: event.duration,
-          thresholdMs,
-          query: event.query,
-          params: '[REDACTED]',
-          parameterCount,
-        }),
-      );
-    });
+  if (typeof filter.minXp === 'number') {
+    params.push(filter.minXp);
+    predicates.push(`a.total_xp >= $${params.length}`);
   }
 
-  async onModuleInit() {
-    if (process.env.SKIP_DB_CONNECT === 'true') {
-      this.logger.log('PrismaService: SKIP_DB_CONNECT active. Skipping database connection.');
-      return;
+  if (filter.role) {
+    params.push(filter.role);
+    predicates.push(`u.role = $${params.length}`);
+  }
+
+  const whereClause = predicates.length > 0 ? `WHERE ${predicates.join(' AND ')}` : '';
+  const safeLimit = Math.max(1, Math.min(500, filter.limit ?? 50));
+  params.push(safeLimit);
+
+  const sql = [
+    'SELECT',
+    '  u.id AS user_id,',
+    '  u.email AS user_email,',
+    '  u.role AS user_role,',
+    '  a.total_xp AS total_xp,',
+    '  a.battles_won AS battles_won',
+    'FROM ext_auth.users u',
+    'INNER JOIN ext_analytics.developer_telemetry a ON a.user_id = u.id',
+    whereClause,
+    'ORDER BY a.total_xp DESC',
+    `LIMIT $${params.length}`,
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  return {
+    sql,
+    params,
+    pushesDownFilters: true,
+    foreignSchemasUsed: ['ext_auth', 'ext_analytics'],
+  };
+}
+
+export class PrismaService {
+  constructor(private readonly rawRunner?: RawSqlRunner) {}
+
+  getFederatedReportPlan(filter: FederatedReportFilter = {}): FederatedJoinQueryPlan {
+    return buildFederatedAdminReportQuery(filter);
+  }
+
+  async executeFederatedAdminReport<TRow = Record<string, unknown>>(
+    filter: FederatedReportFilter = {},
+    runner?: RawSqlRunner,
+  ): Promise<{ rows: TRow[]; plan: FederatedJoinQueryPlan }> {
+    const plan = buildFederatedAdminReportQuery(filter);
+    const activeRunner = runner ?? this.rawRunner;
+
+    if (!activeRunner) {
+      return { rows: [], plan };
     }
-    try {
-      await this.$connect();
-    } catch (err: any) {
-      if (process.env.NODE_ENV === 'test') {
-        this.logger.warn(
-          `PrismaService: Database connection deferred in test/smoke environment: ${err?.message || err}`,
-        );
-        return;
-      }
-      throw err;
-    }
-  }
 
-  async onModuleDestroy() {
-    await this.$disconnect();
-  }
-
-  /**
-   * Executes a read query routed through the intelligent read-replica load balancer
-   * with query cost weighting and automatic replication lag failover.
-   */
-  async executeRead<T>(
-    operationName: string,
-    args: Record<string, unknown> | undefined,
-    action: (client: PrismaClient) => Promise<T>,
-  ): Promise<T> {
-    if (this.replicaBalancer) {
-      return this.replicaBalancer.executeRead(operationName, args, action);
-    }
-    return action(this);
-  }
-
-  /**
-   * Returns the dedicated PrismaClient for a specific tenant organization
-   */
-  getTenantClient(orgId: string | undefined | null): PrismaClient {
-    if (this.tenantSharding) {
-      return this.tenantSharding.getShardClient(orgId);
-    }
-    if (this.shardingRouter) {
-      return this.shardingRouter.getShardClient(orgId);
-    }
-    return this;
-  }
-
-  /**
-   * Executes a database operation routed to the tenant's dedicated database shard
-   * via consistent hashing on organizationId / guildId.
-   */
-  async executeOnTenantShard<T>(
-    tenantId: string | undefined | null,
-    action: (client: PrismaClient) => Promise<T>,
-  ): Promise<T> {
-    if (this.tenantSharding) {
-      return this.tenantSharding.executeOnTenantShard(tenantId, (client) =>
-        action(client),
-      );
-    }
-    if (this.shardingRouter) {
-      return this.shardingRouter.executeOnTenantShard(tenantId, (client) =>
-        action(client),
-      );
-    }
-    return action(this);
-  }
-
-  /**
-   * Cross-shard Scatter-Gather executor:
-   * Fans out queries across all database shards in parallel and aggregates the sorted results.
-   */
-  async scatterGather<T>(
-    queryFn: (client: PrismaClient, shardId: string) => Promise<T[]>,
-    sortFn?: (a: T, b: T) => number,
-    limit?: number,
-  ): Promise<T[]> {
-    if (this.tenantSharding) {
-      const res = await this.tenantSharding.executeCrossShardMapReduce({
-        mapFn: queryFn,
-        reduceFn: (results: T[][]) => {
-          const flat = results.flat();
-          if (sortFn) flat.sort(sortFn);
-          return typeof limit === 'number' && limit > 0 ? flat.slice(0, limit) : flat;
-        },
-      });
-      return res.data;
-    }
-    if (this.shardingRouter) {
-      return this.shardingRouter.scatterGather(queryFn, sortFn, limit);
-    }
-    const results = await queryFn(this, 'default');
-    if (sortFn) results.sort(sortFn);
-    return typeof limit === 'number' && limit > 0
-      ? results.slice(0, limit)
-      : results;
-  }
-
-  /**
-   * Cross-shard Map-Reduce query execution with P95 latency tracking (< 250ms SLA)
-   */
-  async executeCrossShardMapReduce<TMap, TReduce>(
-    options: MapReduceQueryOptions<TMap, TReduce>,
-  ): Promise<MapReduceResult<TReduce>> {
-    if (this.tenantSharding) {
-      return this.tenantSharding.executeCrossShardMapReduce(options);
-    }
-    const startTime = performance.now();
-    const mapped = await options.mapFn(this, 'default');
-    const data = options.reduceFn([mapped]);
-    const durationMs = Math.round((performance.now() - startTime) * 100) / 100;
-    return {
-      data,
-      durationMs,
-      shardsQueriedCount: 1,
-      p95SlaMet: durationMs < 250.0,
-    };
-  }
-
-  /**
-   * Executes atomic 2-Phase Commit (2PC) cross-shard transaction with deadlock prevention
-   */
-  async executeCrossShard2PC<T>(
-    participantOrgOrShardIds: string[],
-    txPlan: (shards: Map<string, PrismaClient>, txId: string) => Promise<T>,
-  ): Promise<{ txId: string; result: T; status: 'COMMITTED' }> {
-    if (this.tenantSharding) {
-      return this.tenantSharding.executeCrossShard2PC(participantOrgOrShardIds, txPlan);
-    }
-    const result = await txPlan(new Map([['default', this]]), `tx-local-${Date.now()}`);
-    return { txId: `tx-local-${Date.now()}`, result, status: 'COMMITTED' };
-  }
-  /**
-   * Rebalance / migrate tenant shard dynamically with zero downtime
-   */
-  async rebalanceTenantShard(
-    tenantId: string,
-    targetShardId: string,
-    syncCallback?: (source: PrismaClient, target: PrismaClient) => Promise<number>,
-  ) {
-    if (this.tenantSharding) {
-      return this.tenantSharding.migrateTenant(tenantId, targetShardId, syncCallback);
-    }
-    return {
-      orgId: tenantId,
-      sourceShardId: 'default',
-      targetShardId,
-      recordsMigrated: 0,
-      durationMs: 0,
-      status: 'COMPLETED' as const,
-    };
-  }
-
-  /**
-   * Routes query to Primary or Read Replica connection pool based on context
-   */
-  async getRoutedClient(context?: RouteContext): Promise<PrismaClient> {
-    if (this.replicaRouter) {
-      return this.replicaRouter.getClient(context);
-    }
-    return this;
-  }
-
-  /**
-   * Executes a Prisma interactive transaction wrapped in full-jitter exponential backoff
-   * deadlock recovery (40P01 / 40001 / 55P03).
-   */
-  async executeTransactionWithDeadlockRetry<T>(
-    fn: (tx: any) => Promise<T>,
-    options?: DeadlockRetryOptions,
-  ): Promise<T> {
-    const runTx = () => (this as any).$transaction((tx: any) => fn(tx));
-    if (this.deadlockResolver) {
-      return this.deadlockResolver.executeWithDeadlockRetry(() => runTx(), options);
-    }
-    return runTx();
-  }
-
-  public readonly zeroDowntimeMigration = new ZeroDowntimeMigrationEngine();
-  public readonly dualWriteCoordinator: DualWriteCoordinator =
-    this.zeroDowntimeMigration.dualWriteCoordinator;
-
-  /**
-   * Checks for active locks or long-running queries on a PostgreSQL table before DDL execution.
-   */
-  async checkTableLocks(
-    tableName: string,
-    maxDurationSec = 5,
-  ): Promise<PreflightLockCheckResult> {
-    return this.zeroDowntimeMigration.checkPreflightLocks(
-      this,
-      tableName,
-      maxDurationSec,
-    );
-  }
-
-  /**
-   * Executes DDL with PostgreSQL lock_timeout (default 2s) and statement_timeout guards
-   * to guarantee zero downtime and avoid cascading queueing on production tables.
-   */
-  async executeZeroDowntimeDDL(
-    ddlSql: string,
-    options?: { lockTimeoutMs?: number; statementTimeoutMs?: number },
-  ): Promise<void> {
-    return this.zeroDowntimeMigration.executeSafeDDL(this, ddlSql, options);
-  }
-
-  /**
-   * Executes Phase 1 (Expand) non-blocking schema migration.
-   */
-  async executePhaseExpand(
-    plan: ExpandPlan,
-  ): Promise<{ applied: string[]; status: 'SUCCESS' }> {
-    return this.zeroDowntimeMigration.executePhaseExpand(this, plan);
-  }
-
-  /**
-   * Executes Phase 3 (Backfill) with keyset pagination & sleep intervals between batches.
-   */
-  async runZeroDowntimeBackfill(
-    options: BackfillOptions,
-    onProgress?: (p: BackfillProgress) => void,
-  ): Promise<BackfillProgress> {
-    return this.zeroDowntimeMigration.runBackfill(this, options, onProgress);
-  }
-
-  /**
-   * Executes automated verification ensuring 100% data consistency between old and new columns.
-   */
-  async verifyMigrationConsistency(options: {
-    tableName: string;
-    primaryKey?: string;
-    sourceColumn: string;
-    targetColumn: string;
-    sampleLimit?: number;
-  }): Promise<VerificationResult> {
-    return this.zeroDowntimeMigration.verifyDataConsistency(this, options);
-  }
-
-  /**
-   * Executes Phase 4 (Contract) safely dropping old columns after verification.
-   */
-  async executePhaseContract(
-    plan: ContractPlan,
-  ): Promise<{ applied: string[]; status: 'SUCCESS' }> {
-    return this.zeroDowntimeMigration.executePhaseContract(this, plan);
-  }
-
-  /**
-   * Rollback execution with fast lock timeouts.
-   */
-  async executeZeroDowntimeRollback(
-    planOrSql:
-      | { tableName?: string; rollbackSql: string[]; lockTimeoutMs?: number }
-      | string[],
-  ): Promise<{ rolledBack: string[]; status: 'SUCCESS' }> {
-    return this.zeroDowntimeMigration.executeRollback(this, planOrSql);
+    const rows = (await activeRunner.queryRaw(plan.sql, plan.params)) as TRow[];
+    return { rows, plan };
   }
 }
