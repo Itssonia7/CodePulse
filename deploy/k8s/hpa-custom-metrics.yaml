@@ -1,0 +1,48 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: codepulse-websocket-hpa
+  namespace: codepulse
+  labels:
+    app: codepulse
+    component: websocket-autoscaler
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: codepulse-realtime
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Pods
+      pods:
+        metric:
+          name: codepulse_active_websockets_count
+        target:
+          type: AverageValue
+          averageValue: "500"
+    - type: External
+      external:
+        metric:
+          name: codepulse_queue_backlog_jobs
+        target:
+          type: AverageValue
+          averageValue: "250"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60

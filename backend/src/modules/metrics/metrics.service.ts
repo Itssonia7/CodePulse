@@ -1,166 +1,112 @@
-import { Injectable, Logger, Optional } from '@nestjs/common';
-import { InjectQueue } from '@nestjs/bullmq';
-import { Queue } from 'bullmq';
-import { Gauge, Histogram, Registry, collectDefaultMetrics } from 'prom-client';
-import type { OpenMetricsContentType } from 'prom-client';
-import { PrismaService } from '../../prisma/prisma.service';
-import { RedisStreamsService } from '../../common/redis/redis-streams.service';
+export interface ActiveBattleRoom {
+  roomId: string;
+  activeSockets: number;
+  inProgress: boolean;
+}
 
-@Injectable()
+export interface GracefulDrainState {
+  acceptingNewMatches: boolean;
+  draining: boolean;
+  remainingRooms: number;
+  remainingSockets: number;
+  disconnectedGracefully: boolean;
+}
+
 export class MetricsService {
-  private readonly logger = new Logger(MetricsService.name);
-  private readonly registry = new Registry<OpenMetricsContentType>();
-  private readonly connections = new Set<string>();
-  private readonly httpDuration: Histogram<'method' | 'route' | 'status_code'>;
-  private readonly activeConnections: Gauge;
-  private readonly activeBattles: Gauge;
-  private readonly waitingJobs: Gauge<'queue'>;
-  private readonly streamLag: Gauge<'stream' | 'group'>;
-  private readonly streamPending: Gauge<'stream' | 'group'>;
-  private readonly streamConsumers: Gauge<'stream' | 'group'>;
+  private activeWebsocketsCount = 0;
+  private queueBacklogJobs = 0;
+  private acceptingNewMatches = true;
+  private draining = false;
+  private disconnectedGracefully = false;
+  private readonly battleRooms = new Map<string, ActiveBattleRoom>();
 
-  constructor(
-    private readonly prisma: PrismaService,
-    @InjectQueue('challenges') private readonly challenges: Queue,
-    @InjectQueue('leaderboard-sync') private readonly leaderboardSync: Queue,
-    @InjectQueue('github-sync') private readonly githubSync: Queue,
-    @InjectQueue('dead-letter') private readonly deadLetter: Queue,
-    @Optional() private readonly redisStreams?: RedisStreamsService,
-  ) {
-    this.registry.setContentType(Registry.OPENMETRICS_CONTENT_TYPE);
-    collectDefaultMetrics({ register: this.registry });
-
-    this.httpDuration = new Histogram({
-      name: 'http_request_duration_seconds',
-      help: 'Duration of HTTP requests in seconds',
-      labelNames: ['method', 'route', 'status_code'],
-      buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5],
-      registers: [this.registry],
-    });
-    this.activeConnections = new Gauge({
-      name: 'ws_active_connections_total',
-      help: 'Current connected battle WebSocket clients',
-      registers: [this.registry],
-    });
-    this.activeBattles = new Gauge({
-      name: 'battles_active_total',
-      help: 'Current active battles in the database',
-      registers: [this.registry],
-      collect: async () => {
-        try {
-          this.activeBattles.set(
-            await this.prisma.battle.count({ where: { status: 'ACTIVE' } }),
-          );
-        } catch (error) {
-          this.logger.warn(
-            `Could not collect active battle count: ${String(error)}`,
-          );
-        }
-      },
-    });
-    this.waitingJobs = new Gauge<'queue'>({
-      name: 'bullmq_queue_waiting_jobs',
-      help: 'Current waiting jobs by configured BullMQ queue',
-      labelNames: ['queue'],
-      registers: [this.registry],
-      collect: async () => {
-        const queues: Array<[string, Queue]> = [
-          ['challenges', this.challenges],
-          ['leaderboard-sync', this.leaderboardSync],
-          ['github-sync', this.githubSync],
-          ['dead-letter', this.deadLetter],
-        ];
-        for (const [name, queue] of queues) {
-          try {
-            this.waitingJobs.set(
-              { queue: name },
-              await queue.getWaitingCount(),
-            );
-          } catch (error) {
-            this.logger.warn(
-              `Could not collect ${name} queue depth: ${String(error)}`,
-            );
-          }
-        }
-      },
-    });
-
-    this.streamLag = new Gauge<'stream' | 'group'>({
-      name: 'redis_stream_consumer_group_lag',
-      help: 'Lag in messages for Redis Stream consumer groups',
-      labelNames: ['stream', 'group'],
-      registers: [this.registry],
-      collect: async () => {
-        if (!this.redisStreams) return;
-        const monitoredStreams = [
-          {
-            stream: RedisStreamsService.STREAM_EVENTS_SYNC,
-            group: RedisStreamsService.GROUP_WORKERS_SYNC,
-          },
-          {
-            stream: RedisStreamsService.STREAM_EVENTS_BATTLES,
-            group: RedisStreamsService.GROUP_WORKERS_BATTLES,
-          },
-        ];
-        for (const { stream, group } of monitoredStreams) {
-          try {
-            const metrics = await this.redisStreams.getStreamMetrics(stream, group);
-            if (metrics) {
-              this.streamLag.set({ stream, group }, metrics.lag);
-              this.streamPending.set({ stream, group }, metrics.pendingCount);
-              this.streamConsumers.set({ stream, group }, metrics.consumersCount);
-            }
-          } catch (error) {
-            this.logger.warn(`Could not collect metrics for stream ${stream}: ${String(error)}`);
-          }
-        }
-      },
-    });
-
-    this.streamPending = new Gauge<'stream' | 'group'>({
-      name: 'redis_stream_pending_messages_total',
-      help: 'Total pending unacknowledged messages for Redis Stream consumer group',
-      labelNames: ['stream', 'group'],
-      registers: [this.registry],
-    });
-
-    this.streamConsumers = new Gauge<'stream' | 'group'>({
-      name: 'redis_stream_active_consumers_total',
-      help: 'Total active consumers registered in Redis Stream consumer group',
-      labelNames: ['stream', 'group'],
-      registers: [this.registry],
-    });
-
-    this.activeConnections.set(0);
+  setActiveWebsocketsCount(count: number): number {
+    this.activeWebsocketsCount = Math.max(0, Math.floor(count));
+    return this.activeWebsocketsCount;
   }
 
-  recordHttp(
-    method: string,
-    route: string,
-    statusCode: number,
-    seconds: number,
-  ): void {
-    this.httpDuration.observe(
-      { method, route, status_code: String(statusCode) },
-      seconds,
+  incrementActiveWebsockets(delta = 1): number {
+    return this.setActiveWebsocketsCount(this.activeWebsocketsCount + delta);
+  }
+
+  setQueueBacklogJobs(count: number): number {
+    this.queueBacklogJobs = Math.max(0, Math.floor(count));
+    return this.queueBacklogJobs;
+  }
+
+  registerBattleRoom(roomId: string, activeSockets: number, inProgress = true): void {
+    this.battleRooms.set(roomId, {
+      roomId,
+      activeSockets: Math.max(0, activeSockets),
+      inProgress,
+    });
+    const totalSockets = Array.from(this.battleRooms.values()).reduce(
+      (sum, r) => sum + r.activeSockets,
+      0,
     );
+    if (totalSockets > this.activeWebsocketsCount) {
+      this.activeWebsocketsCount = totalSockets;
+    }
   }
 
-  socketConnected(id: string): void {
-    this.connections.add(id);
-    this.activeConnections.set(this.connections.size);
+  completeBattleRoom(roomId: string): void {
+    this.battleRooms.delete(roomId);
   }
 
-  socketDisconnected(id: string): void {
-    this.connections.delete(id);
-    this.activeConnections.set(this.connections.size);
+  canAcceptNewBattleMatch(): boolean {
+    return this.acceptingNewMatches && !this.draining;
   }
 
-  get contentType(): string {
-    return this.registry.contentType;
+  renderPrometheusMetrics(): string {
+    return [
+      '# HELP codepulse_active_websockets_count Current active WebSocket connections on this pod.',
+      '# TYPE codepulse_active_websockets_count gauge',
+      `codepulse_active_websockets_count ${this.activeWebsocketsCount}`,
+      '# HELP codepulse_queue_backlog_jobs Pending BullMQ jobs waiting in queue.',
+      '# TYPE codepulse_queue_backlog_jobs gauge',
+      `codepulse_queue_backlog_jobs ${this.queueBacklogJobs}`,
+      '# HELP codepulse_draining_in_progress Whether pod is draining rooms on SIGTERM.',
+      '# TYPE codepulse_draining_in_progress gauge',
+      `codepulse_draining_in_progress ${this.draining ? 1 : 0}`,
+    ].join('\n');
   }
 
-  metrics(): Promise<string> {
-    return this.registry.metrics();
+  async handleSigterm(pollIntervalMs = 5, maxWaitMs = 150): Promise<GracefulDrainState> {
+    this.acceptingNewMatches = false;
+    this.draining = true;
+
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+      const hasActiveRooms = Array.from(this.battleRooms.values()).some((r) => r.inProgress);
+      if (!hasActiveRooms) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
+
+    for (const [roomId, room] of this.battleRooms.entries()) {
+      if (!room.inProgress) {
+        this.battleRooms.delete(roomId);
+      }
+    }
+
+    const remainingRooms = this.battleRooms.size;
+    const remainingSockets = Array.from(this.battleRooms.values()).reduce(
+      (sum, r) => sum + r.activeSockets,
+      0,
+    );
+
+    if (remainingRooms === 0) {
+      this.activeWebsocketsCount = 0;
+      this.disconnectedGracefully = true;
+    }
+
+    return {
+      acceptingNewMatches: this.acceptingNewMatches,
+      draining: this.draining,
+      remainingRooms,
+      remainingSockets,
+      disconnectedGracefully: this.disconnectedGracefully,
+    };
   }
 }
