@@ -135,7 +135,6 @@ model DeveloperRating {
   @@map("developer_ratings")
 }
 
-/// Competitive MMR is independent of the GitHub activity score in DeveloperRating.
 model BattleRating {
   userId                    String   @id
   elo                       Float    @default(1200)
@@ -164,7 +163,6 @@ model BattleSeason {
   @@map("battle_seasons")
 }
 
-/// Snapshot names and ratings so Hall of Fame entries survive profile deletion.
 model SeasonArchive {
   id          String       @id @default(uuid())
   seasonNumber Int
@@ -697,7 +695,6 @@ model StorageTierMetrics {
   @@index([recordedAt])
   @@map("storage_tier_metrics")
 }
-
 
 model SamlTenantConfig {
   id                  String   @id @default(uuid())
@@ -1350,8 +1347,6 @@ model GdprDeletionCertificate {
   @@map("gdpr_deletion_certificates")
 }
 
-// Declarative Range Partitioning by Month on createdAt (#1058)
-// Managed via backend/prisma/migrations/partitioning.sql
 model AuditLog {
   id         String   @id @default(uuid())
   actorId    String?
@@ -1372,8 +1367,6 @@ model AuditLog {
   @@map("audit_logs")
 }
 
-// Declarative Range Partitioning by Month on createdAt (#1058)
-// Managed via backend/prisma/migrations/partitioning.sql
 model BattleSubmission {
   id              String     @id @default(uuid())
   battleId        String
@@ -1454,6 +1447,7 @@ model CodeReviewFinding {
   @@index([status])
   @@map("code_review_findings")
 }
+
 model ReleaseChangelog {
   id                 String   @id @default(uuid())
   repository         String
@@ -1606,7 +1600,6 @@ model TournamentMatch {
   @@map("tournament_matches")
 }
 
-
 model AiReviewAudit {
   id                  String   @id @default(uuid())
   prNumber            Int
@@ -1756,6 +1749,7 @@ model SecurityPatch {
   @@index([status])
   @@map("security_patches")
 }
+
 model TechnicalDebtForecast {
   id                              String      @id @default(uuid())
   repositoryId                    String
@@ -1801,7 +1795,6 @@ model MaintainabilitySnapshot {
   @@index([filePath])
   @@map("maintainability_snapshots")
 }
-
 
 model TerritoryNode {
   id             String   @id @default(uuid())
@@ -1957,17 +1950,21 @@ model ExecutiveReportJob {
   @@map("executive_report_jobs")
 }
 
+model PerformanceProfileRun {
+  id                       String   @id @default(cuid())
+  repositoryId             String
+  commitSha                String
+  parentCommitSha          String?
+  cpuTimeIncreasePercent   Float
+  p95LatencyMs             Float
+  memoryFootprintMb        Float
+  memoryDeltaMb            Float
+  gcFrequencyPerSec        Float
+  complexityEstimate       String
+  regressionDetected       Boolean  @default(false)
+  culpritFunctions         String[]
+  aiRootCauseAnalysis      String
+  createdAt                DateTime @default(now())
 
-model AiReviewAudit {
-  id                 String   @id @default(cuid())
-  repository         String
-  prNumber           Int
-  eventName          String
-  diagnosticsCount   Int      @default(0)
-  suggestionsPosted  Int      @default(0)
-  acceptedCount      Int      @default(0)
-  fixAcceptanceRate  Float    @default(0)
-  createdAt          DateTime @default(now())
-
-  @@index([repository, prNumber])
+  @@index([repositoryId, commitSha])
 }
