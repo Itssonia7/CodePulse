@@ -1957,3 +1957,41 @@ model ExecutiveReportJob {
   @@map("executive_report_jobs")
 }
 
+
+model PerformanceProfileRun {
+  id                       String   @id @default(cuid())
+  repositoryId             String
+  commitSha                String
+  parentCommitSha          String?
+  cpuTimeIncreasePercent   Float
+  p95LatencyMs             Float
+  memoryFootprintMb        Float
+  memoryDeltaMb            Float
+  gcFrequencyPerSec        Float
+  complexityEstimate       String
+  regressionDetected       Boolean  @default(false)
+  culpritFunctions         String[]
+  aiRootCauseAnalysis      String
+  createdAt                DateTime @default(now())
+
+  @@index([repositoryId, commitSha])
+}
+
+model PerformanceProfileRun {
+  id                       String   @id @default(cuid())
+  repositoryId             String
+  commitSha                String
+  parentCommitSha          String?
+  cpuTimeIncreasePercent   Float
+  p95LatencyMs             Float
+  memoryFootprintMb        Float
+  memoryDeltaMb            Float
+  gcFrequencyPerSec        Float
+  complexityEstimate       String
+  regressionDetected       Boolean  @default(false)
+  culpritFunctions         String[]
+  aiRootCauseAnalysis      String
+  createdAt                DateTime @default(now())
+
+  @@index([repositoryId, commitSha])
+}
